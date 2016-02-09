@@ -21,12 +21,12 @@ import tmpo
 #compatibility with py3
 if sys.version_info.major == 3:
     from .site import Site
-    from .device import Fluksometer
-    from .sensor import Fluksosensor
+    from .device import Device, Fluksometer
+    from .sensor import Sensor, Fluksosensor
 else:
     from site import Site
-    from device import Fluksometer
-    from sensor import Fluksosensor
+    from device import Device, Fluksometer
+    from sensor import Sensor, Fluksosensor
 
 """
 The Houseprint is a Singleton object which contains all metadata for sites, devices and sensors.
@@ -186,16 +186,19 @@ class Houseprint(object):
 
             #create new sensor according to its manufacturer
             if r['manufacturer'] == 'Flukso':
-                new_sensor = Fluksosensor(device = device,
-                                         key = r['Sensor_id'],
-                                         token = r['token'],
-                                         type = r['sensor type'],
-                                         description = r['name by user'],
-                                         system = r['system'],
-                                         quantity = r['quantity'],
-                                         unit = r['unit'],
-                                         direction = r['direction'],
-                                         tariff = r['tariff'])
+                new_sensor = Fluksosensor(
+                                          device = device,
+                                          key = r['Sensor_id'],
+                                          token = r['token'],
+                                          type = r['sensor type'],
+                                          description = r['name by user'],
+                                          system = r['system'],
+                                          quantity = r['quantity'],
+                                          unit = r['unit'],
+                                          direction = r['direction'],
+                                          tariff = r['tariff'],
+                                          cumulative = None # will be determined based on type
+                                          )
             else:
                 raise NotImplementedError('Sensors from {} are not supported'.format(r['manufacturer']))
 
@@ -247,19 +250,17 @@ class Houseprint(object):
             Returns
             -------
             List of sites satisfying the search criterion or empty list if no
-            result found.
+            variable found.
         '''
         
         result = []
         for site in self.sites:
-            keep = False
             for keyword, value in kwargs.items():
                 if getattr(site, keyword) == value:
-                    keep = True
+                    continue
                 else:
-                    keep = False
                     break
-            if keep:
+            else:
                 result.append(site)
                 
         return result
@@ -274,19 +275,17 @@ class Houseprint(object):
             Returns
             -------
             List of sensors satisfying the search criterion or empty list if no
-            result found.
+            variable found.
         '''
         
         result = []
         for sensor in self.get_sensors():
-            keep = False
             for keyword, value in kwargs.items():
-                if getattr(sensor, keyword) == value:
-                    keep = True
+                if value in getattr(sensor, keyword):
+                    continue
                 else:
-                    keep = False
                     break
-            if keep:
+            else:
                 result.append(sensor)
                 
         return result        
@@ -319,7 +318,7 @@ class Houseprint(object):
             Device
         '''
         for device in self.get_devices():
-            if device.key == key:
+            if device.key.lower() == key.lower():
                 return device
         return None
 
@@ -334,7 +333,7 @@ class Houseprint(object):
             Sensor
         '''
         for sensor in self.get_sensors():
-            if sensor.key == key:
+            if sensor.key.lower() == key.lower():
                 return sensor
         return None
 
@@ -373,12 +372,16 @@ class Houseprint(object):
     def init_tmpo(self, tmpos=None, path_to_tmpo_data=None):
         """
             Fluksosensors need a tmpo session to obtain data.
-            It is overkill to have each fluksosensor make its own session, syncing would take too long and be overly redundant.
-            Passing a tmpo session to the get_data function is also bad form because we might add new types of sensors that don't use tmpo in the future.
+            It is overkill to have each fluksosensor make its own session, syncing would 
+            take too long and be overly redundant.
+            Passing a tmpo session to the get_data function is also bad form because 
+            we might add new types of sensors that don't use tmpo in the future.
             This is why the session is initialised here.
 
-            A tmpo session as parameter is optional.
+            A tmpo session as parameter is optional.  If passed, no additional sensors are added.
+            
             If no session is passed, a new one will be created using the location in the config file.
+            It will then be populated with the fluksosensors known to the houseprint object
         """
 
         if tmpos is not None:
@@ -390,6 +393,13 @@ class Houseprint(object):
                 path_to_tmpo_data = None            
             
             self._tmpos = tmpo.Session(path_to_tmpo_data)
+            # Add fluksosensors
+            fluksosensors = [sensor for sensor in self.get_sensors() if isinstance(sensor,Fluksosensor)]
+
+            for sensor in fluksosensors:
+                self._tmpos.add(sensor.key, sensor.token)
+
+        print("Using tmpo database from {}".format(self._tmpos.db))
 
     def get_tmpos(self):
         """
@@ -409,14 +419,9 @@ class Houseprint(object):
             Add all Fluksosensors to the TMPO session and sync
         """
         tmpos = self.get_tmpos()
-        fluksosensors = [sensor for sensor in self.get_sensors() if isinstance(sensor,Fluksosensor)]
-
-        for sensor in fluksosensors:
-            tmpos.add(sensor.key, sensor.token)
-
         tmpos.sync()
 
-    def get_data(self, sensors=None, sensortype=None, head=None, tail=None, resample='min'):
+    def get_data(self, sensors=None, sensortype=None, head=None, tail=None, diff='default', resample='min', unit='default'):
         """
         Return a Pandas Dataframe with joined data for the given sensors
 
@@ -427,14 +432,31 @@ class Houseprint(object):
         sensortype : string (optional)
             gas, water, electricity. If None, and Sensors = None,
             all available sensors in the houseprint are fetched
-
-        head, tail: timestamps
+        head, tail: timestamps,
+        diff : bool or 'default'
+            If True, the original data will be differentiated
+            If 'default', the sensor will decide: if it has the attribute
+            cumulative==True, the data will be differentiated.
+        resample : str (default='min')
+            Sampling rate, if any.  Use 'raw' if no resampling.
+        unit : str , default='default'
+            String representation of the target unit, eg m**3/h, kW, ...
         
         """
         if sensors is None:        
             sensors = self.get_sensors(sensortype)
-        series = [sensor.get_data(head=head,tail=tail,resample=resample) for sensor in sensors]
-        return pd.concat(series, axis=1)
+        series = [sensor.get_data(head=head, tail=tail, diff=diff, resample=resample, unit=unit) for sensor in sensors]
+        df =  pd.concat(series, axis=1)
+
+        # Add unit as string to each series in the df.  This is not persistent: the attribute unit will get
+        # lost when doing operations with df, but at least it can be checked once.
+        for s in series:
+            try:
+                df[s.name].unit = s.unit
+            except:
+                pass
+
+        return df
 
 def load_houseprint_from_file(filename):
     """Return a static (=anonymous) houseprint object"""
